@@ -44,6 +44,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // Register adds this handler's routes to the mux.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/payments", h.createPayment)
+	mux.HandleFunc("GET /v1/payments/{id}", h.getPayment)
 }
 
 func (h *Handler) createPayment(w http.ResponseWriter, r *http.Request) {
