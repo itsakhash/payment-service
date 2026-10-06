@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/itsakhash/payment-service/internal/api"
+	"github.com/itsakhash/payment-service/internal/payments"
 )
 
 func main() {
@@ -29,6 +32,9 @@ func main() {
 		log.Fatalf("ping db: %v", err)
 	}
 
+	svc := payments.NewService(pool)
+	handler := api.New(svc)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
@@ -37,7 +43,13 @@ func main() {
 		}
 		w.Write([]byte("ok"))
 	})
+	handler.Register(mux)
 
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(srv.ListenAndServe())
 }
