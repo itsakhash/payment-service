@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package payment.v1;
+
+option go_package = "github.com/itsakhash/payment-service/internal/gen/paymentpb";
+
+service PaymentService {
+  rpc CreatePayment(CreatePaymentRequest) returns (CreatePaymentResponse);
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+}
+
+message CreatePaymentRequest {
+  string client_id = 1;
+  string idempotency_key = 2;
+  int64 payer_account_id = 3;
+  int64 payee_account_id = 4;
+  int64 amount_minor = 5;
+  string currency = 6;
+}
+
+message CreatePaymentResponse {
+  string payment_id = 1;
+  string status = 2;
+  bool replayed = 3;
+}
+
+message GetPaymentRequest {
+  string payment_id = 1;
+}
+
+message GetPaymentResponse {
+  string payment_id = 1;
+  string status = 2;
+}

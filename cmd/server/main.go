@@ -11,6 +11,13 @@ import (
 
 	"github.com/itsakhash/payment-service/internal/api"
 	"github.com/itsakhash/payment-service/internal/payments"
+
+	"net"
+
+	"google.golang.org/grpc"
+
+	"github.com/itsakhash/payment-service/internal/gen/paymentpb"
+	"github.com/itsakhash/payment-service/internal/grpcapi"
 )
 
 func main() {
@@ -34,6 +41,16 @@ func main() {
 
 	svc := payments.NewService(pool)
 	handler := api.New(svc)
+	go func() {
+		lis, err := net.Listen("tcp", ":9090")
+		if err != nil {
+			log.Fatal(err)
+		}
+		gs := grpc.NewServer()
+		paymentpb.RegisterPaymentServiceServer(gs, grpcapi.New(svc))
+		log.Println("grpc listening on :9090")
+		log.Fatal(gs.Serve(lis))
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
