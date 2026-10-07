@@ -146,57 +146,25 @@ func (s *Service) CreatePayment(ctx context.Context, req CreateRequest) (Result,
 
 	// PART 3: decide the outcome.
 	status := "SUCCEEDED"
-	var failureReason any // nil is stored as NULL
 	if balances[req.PayerAccountID] < req.AmountMinor {
 		status = "FAILED"
-		failureReason = "insufficient_funds"
 	}
 
+	// PART 4: record everything in ONE statement (one round trip) so the
+	// account locks are held for as little time as possible.
+	query := recordSucceededSQL
+	if status == "FAILED" {
+		query = recordFailedSQL
+	}
 	var paymentID string
-	err = tx.QueryRow(ctx, `
-		INSERT INTO payments
-			(id, client_id, payer_account_id, payee_account_id, amount_minor, currency, status, failure_reason)
-		VALUES
-			(gen_random_uuid(), $1, $2, $3, $4, $5, $6::text::payment_status, $7)
-		RETURNING id::text`,
+	err = tx.QueryRow(ctx, query,
 		req.ClientID, req.PayerAccountID, req.PayeeAccountID, req.AmountMinor,
-		req.Currency, status, failureReason).Scan(&paymentID)
+		req.Currency, req.IdempotencyKey).Scan(&paymentID)
 	if err != nil {
-		return Result{}, fmt.Errorf("insert payment: %w", err)
+		return Result{}, fmt.Errorf("record payment: %w", err)
 	}
 
-	// PART 4: only a successful payment moves money.
-	if status == "SUCCEEDED" {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO ledger_entries (payment_id, account_id, direction, amount_minor)
-			VALUES ($1::text::uuid, $2, 'D', $4),
-			       ($1::text::uuid, $3, 'C', $4)`,
-			paymentID, req.PayerAccountID, req.PayeeAccountID, req.AmountMinor)
-		if err != nil {
-			return Result{}, fmt.Errorf("insert ledger: %w", err)
-		}
-		_, err = tx.Exec(ctx,
-			`UPDATE accounts SET balance_minor = balance_minor - $2 WHERE id = $1`,
-			req.PayerAccountID, req.AmountMinor)
-		if err != nil {
-			return Result{}, fmt.Errorf("debit payer: %w", err)
-		}
-		_, err = tx.Exec(ctx,
-			`UPDATE accounts SET balance_minor = balance_minor + $2 WHERE id = $1`,
-			req.PayeeAccountID, req.AmountMinor)
-		if err != nil {
-			return Result{}, fmt.Errorf("credit payee: %w", err)
-		}
-	}
-
-	// PART 5: remember which payment this key produced, then commit everything at once.
-	_, err = tx.Exec(ctx, `
-		UPDATE idempotency_keys SET payment_id = $3::text::uuid
-		WHERE client_id = $1 AND idem_key = $2`,
-		req.ClientID, req.IdempotencyKey, paymentID)
-	if err != nil {
-		return Result{}, fmt.Errorf("store key result: %w", err)
-	}
+	// PART 5: commit everything at once.
 	if err := tx.Commit(ctx); err != nil {
 		return Result{}, fmt.Errorf("commit: %w", err)
 	}
