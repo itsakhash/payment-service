@@ -36,11 +36,12 @@ var (
 
 // Service holds the business logic. Both the REST and gRPC APIs will call it.
 type Service struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	limiter *accountLimiter
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool}
+	return &Service{pool: pool, limiter: newAccountLimiter(accountConcurrencyFromEnv())}
 }
 
 // requestHash fingerprints the contents of a request, so we can tell a true
@@ -61,6 +62,14 @@ func (s *Service) CreatePayment(ctx context.Context, req CreateRequest) (Result,
 	}
 
 	hash := requestHash(req)
+
+	// Wait for a slot on both accounts BEFORE taking a database connection,
+	// so requests queued behind a hot account don't tie up the pool.
+	release, err := s.limiter.acquirePair(ctx, req.PayerAccountID, req.PayeeAccountID)
+	if err != nil {
+		return Result{}, fmt.Errorf("wait for account slot: %w", err)
+	}
+	defer release()
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
