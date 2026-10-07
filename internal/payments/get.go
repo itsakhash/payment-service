@@ -18,11 +18,17 @@ type Payment struct {
 	Status    string
 }
 
-// GetPayment looks up a payment by id.
+// GetPayment looks up a payment by id, using the cache when one is configured.
 // Malformed ids return ErrInvalidRequest; unknown ids return ErrPaymentNotFound.
 func (s *Service) GetPayment(ctx context.Context, id string) (Payment, error) {
 	if !uuidRe.MatchString(id) {
 		return Payment{}, ErrInvalidRequest
+	}
+
+	if s.cache != nil {
+		if p, ok := s.cache.Get(ctx, id); ok {
+			return p, nil
+		}
 	}
 
 	var p Payment
@@ -35,6 +41,10 @@ func (s *Service) GetPayment(ctx context.Context, id string) (Payment, error) {
 	}
 	if err != nil {
 		return Payment{}, err
+	}
+
+	if s.cache != nil {
+		s.cache.Set(ctx, p)
 	}
 	return p, nil
 }

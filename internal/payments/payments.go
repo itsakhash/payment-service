@@ -38,6 +38,7 @@ var (
 type Service struct {
 	pool    *pgxpool.Pool
 	limiter *accountLimiter
+	cache   Cache
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
