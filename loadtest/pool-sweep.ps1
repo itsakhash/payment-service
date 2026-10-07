@@ -1,13 +1,17 @@
 param(
     [string]$Scenario = "hot",
     [string]$Tag = "",
+    [string]$SrcDir = ".",
     [int[]]$Sizes = @(2, 4, 8, 16),
     [int]$Runs = 2
 )
 
 $exe = "$env:TEMP\payment-server.exe"
+Push-Location $SrcDir
 go build -o $exe ./cmd/server
-if ($LASTEXITCODE -ne 0) { throw "build failed" }
+$buildExit = $LASTEXITCODE
+Pop-Location
+if ($buildExit -ne 0) { throw "build failed" }
 
 foreach ($n in $Sizes) {
     $env:DATABASE_URL = "postgres://payments:payments@localhost:5432/payments?pool_max_conns=$n"
