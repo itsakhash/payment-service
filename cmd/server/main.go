@@ -26,6 +26,10 @@ import (
 	"github.com/itsakhash/payment-service/internal/ratelimit"
 
 	"github.com/itsakhash/payment-service/internal/paymentcache"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/itsakhash/payment-service/internal/metrics"
 )
 
 func main() {
@@ -80,6 +84,7 @@ func main() {
 		}
 		w.Write([]byte("ok"))
 	})
+	mux.Handle("GET /metrics", promhttp.Handler())
 	handler.Register(mux)
 
 	var root http.Handler = mux
@@ -102,6 +107,8 @@ func main() {
 		root = ratelimit.Middleware(ratelimit.New(redis.NewClient(opt), burst, rps), mux)
 		log.Printf("rate limiting on: %.0f req/s per client, burst %d", rps, burst)
 	}
+
+	root = metrics.Middleware(root) // outermost, so rate-limited (429) requests are counted too
 
 	srv := &http.Server{
 		Addr:              ":8080",

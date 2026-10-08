@@ -54,10 +54,10 @@ func requestHash(req CreateRequest) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CreatePayment moves money from payer to payee exactly once per idempotency key.
+// createPayment moves money from payer to payee exactly once per idempotency key.
 // Everything happens inside ONE database transaction: either all of it commits,
 // or none of it does.
-func (s *Service) CreatePayment(ctx context.Context, req CreateRequest) (Result, error) {
+func (s *Service) createPayment(ctx context.Context, req CreateRequest) (Result, error) {
 	if req.ClientID == "" || req.IdempotencyKey == "" || req.Currency == "" ||
 		req.AmountMinor <= 0 || req.PayerAccountID == req.PayeeAccountID {
 		return Result{}, ErrInvalidRequest
