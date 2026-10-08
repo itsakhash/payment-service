@@ -72,13 +72,49 @@ func main() {
 		svc.WithCache(paymentcache.New(redis.NewClient(cacheOpt), ttl))
 		log.Printf("payment read cache on (ttl %s)", ttl)
 	}
+
+	// Optional rate limiting. One limiter is shared by REST and gRPC, so a
+	// client has a single budget across both protocols.
+	var limiter *ratelimit.Limiter
+	if rps, _ := strconv.ParseFloat(os.Getenv("RATE_LIMIT_PER_SEC"), 64); rps > 0 {
+		burst, _ := strconv.Atoi(os.Getenv("RATE_LIMIT_BURST"))
+		if burst <= 0 {
+			burst = int(rps * 2)
+		}
+		if burst < 1 {
+			burst = 1
+		}
+		redisURL := os.Getenv("REDIS_URL")
+		if redisURL == "" {
+			redisURL = "redis://localhost:6379/0"
+		}
+		opt, err := redis.ParseURL(redisURL)
+		if err != nil {
+			log.Fatal(err)
+		}
+		limiter = ratelimit.New(redis.NewClient(opt), burst, rps)
+		log.Printf("rate limiting on (REST and gRPC): %.0f req/s per client, burst %d", rps, burst)
+	}
+
 	handler := api.New(svc)
+
 	go func() {
 		lis, err := net.Listen("tcp", ":9090")
 		if err != nil {
 			log.Fatal(err)
 		}
-		gs := grpc.NewServer()
+		var opts []grpc.ServerOption
+		if limiter != nil {
+			opts = append(opts, grpc.UnaryInterceptor(ratelimit.UnaryInterceptor(
+				limiter,
+				"/payment.v1.PaymentService/CreatePayment",
+				func(req any) string {
+					r, _ := req.(*paymentpb.CreatePaymentRequest)
+					return r.GetClientId() // nil-safe generated getter
+				},
+			)))
+		}
+		gs := grpc.NewServer(opts...)
 		paymentpb.RegisterPaymentServiceServer(gs, grpcapi.New(svc))
 		log.Println("grpc listening on :9090")
 		log.Fatal(gs.Serve(lis))
@@ -96,24 +132,8 @@ func main() {
 	handler.Register(mux)
 
 	var root http.Handler = mux
-	if rps, _ := strconv.ParseFloat(os.Getenv("RATE_LIMIT_PER_SEC"), 64); rps > 0 {
-		burst, _ := strconv.Atoi(os.Getenv("RATE_LIMIT_BURST"))
-		if burst <= 0 {
-			burst = int(rps * 2)
-		}
-		if burst < 1 {
-			burst = 1
-		}
-		redisURL := os.Getenv("REDIS_URL")
-		if redisURL == "" {
-			redisURL = "redis://localhost:6379/0"
-		}
-		opt, err := redis.ParseURL(redisURL)
-		if err != nil {
-			log.Fatal(err)
-		}
-		root = ratelimit.Middleware(ratelimit.New(redis.NewClient(opt), burst, rps), mux)
-		log.Printf("rate limiting on: %.0f req/s per client, burst %d", rps, burst)
+	if limiter != nil {
+		root = ratelimit.Middleware(limiter, mux)
 	}
 
 	root = metrics.Middleware(root) // outermost, so rate-limited (429) requests are counted too
