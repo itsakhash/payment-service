@@ -39,6 +39,7 @@ type Service struct {
 	pool    *pgxpool.Pool
 	limiter *accountLimiter
 	cache   Cache
+	fault   func(faultPoint) error // test-only failure injection; nil in production
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
@@ -119,6 +120,10 @@ func (s *Service) CreatePayment(ctx context.Context, req CreateRequest) (Result,
 		return Result{PaymentID: storedPaymentID, Status: status, Replayed: true}, nil
 	}
 
+	if err := s.inject(faultAfterKeyClaim); err != nil {
+		return Result{}, err
+	}
+
 	// PART 2: lock both accounts, always lowest id first.
 	// A consistent order means two payments going in opposite directions
 	// can never wait on each other forever (a deadlock).
@@ -154,6 +159,10 @@ func (s *Service) CreatePayment(ctx context.Context, req CreateRequest) (Result,
 		return Result{}, fmt.Errorf("%w: currency mismatch", ErrInvalidRequest)
 	}
 
+	if err := s.inject(faultAfterLock); err != nil {
+		return Result{}, err
+	}
+
 	// PART 3: decide the outcome.
 	status := "SUCCEEDED"
 	if balances[req.PayerAccountID] < req.AmountMinor {
@@ -174,9 +183,17 @@ func (s *Service) CreatePayment(ctx context.Context, req CreateRequest) (Result,
 		return Result{}, fmt.Errorf("record payment: %w", err)
 	}
 
+	if err := s.inject(faultBeforeCommit); err != nil {
+		return Result{}, err
+	}
+
 	// PART 5: commit everything at once.
 	if err := tx.Commit(ctx); err != nil {
 		return Result{}, fmt.Errorf("commit: %w", err)
+	}
+
+	if err := s.inject(faultAfterCommit); err != nil {
+		return Result{}, err
 	}
 
 	return Result{PaymentID: paymentID, Status: status, Replayed: false}, nil
