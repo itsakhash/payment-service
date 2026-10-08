@@ -1,8 +1,8 @@
 # Payment Processing Service
 
-A payment backend written in Go, backed by PostgreSQL and Redis. It moves money between accounts using a double-entry ledger and is designed so that retried or concurrent requests can never charge a customer twice. It exposes both a REST and a gRPC API, and its throughput under contention is measured with k6.
+A payment backend written in Go, backed by PostgreSQL and Redis. It moves money between accounts using a double-entry ledger and is designed so that retried, concurrent, or interrupted requests can never charge a customer twice or lose money. It exposes REST and gRPC APIs, checks its own books, and its behavior under contention and failure is tested and measured.
 
-> **Status: in progress.** Milestones 1–3 (core API, ledger integrity and gRPC, performance work) are complete. Reconciliation, fault injection, and observability are still planned. See the [Roadmap](#roadmap).
+> **Status: all five milestones complete.** This is a learning project, not a production system. See [Known Limitations](#known-limitations) and the full write-up in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Features
 
@@ -14,9 +14,12 @@ A payment backend written in Go, backed by PostgreSQL and Redis. It moves money 
 - **Failed payments are recorded** — an insufficient-funds attempt is stored as a `FAILED` payment (HTTP 402) and moves no money.
 - **REST and gRPC APIs** — both are thin layers over the same service code, so the money logic exists in one place.
 - **Ledger invariant checker** — verifies, inside one read-only snapshot, that every successful payment has exactly one matching debit and credit, that failed payments moved no money, and that total debits equal total credits.
+- **Reconciliation** — detects balance drift (an account balance that no longer matches its ledger history) and idempotency keys that never produced a payment. Runs as a command-line tool (non-zero exit code on violations) and as an optional background loop.
+- **Fault injection and chaos testing** — a test hook fails a payment at four points in its lifecycle, and a chaos test combines random failures and killed database connections under concurrent load.
 - **Per-account concurrency limiter** — caps how many in-flight payments may touch one account, so requests queued behind a hot account wait in Go instead of holding database connections.
-- **Redis rate limiter** — a token bucket per `X-Client-Id` on `POST /v1/payments`, returning `429` with a `Retry-After` header. It runs as one atomic Lua script in Redis and fails open if Redis is unavailable.
+- **Redis rate limiter** — a token bucket per client on `POST /v1/payments` (REST) and `CreatePayment` (gRPC), sharing one budget across both. Returns `429` with `Retry-After`, or gRPC `ResourceExhausted`. It runs as one atomic Lua script in Redis and fails open if Redis is unavailable.
 - **Redis read cache** — cache-aside caching for `GET /v1/payments/{id}`. Stored payments never change, so there is nothing to invalidate. Misses and Redis failures fall through to Postgres.
+- **Metrics and dashboard** — Prometheus metrics at `/metrics` and a provisioned Grafana dashboard.
 
 ## API
 
@@ -25,6 +28,7 @@ A payment backend written in Go, backed by PostgreSQL and Redis. It moves money 
 | `POST` | `/v1/payments` | Create a payment (idempotent) |
 | `GET` | `/v1/payments/{id}` | Fetch a payment by id |
 | `GET` | `/healthz` | Liveness and database check |
+| `GET` | `/metrics` | Prometheus metrics |
 
 gRPC (port `9090`): `payment.v1.PaymentService` with `CreatePayment` and `GetPayment`. The contract is in `proto/payment/v1/payment.proto`.
 
@@ -58,10 +62,12 @@ gRPC (port `9090`): `payment.v1.PaymentService` with `CreatePayment` and `GetPay
     internal/api              internal/grpcapi      translate requests, map errors to status codes
         └──────────────┬────────────┘
                        ▼
-               internal/payments          idempotency, account locking, ledger, invariants
+               internal/payments          idempotency, account locking, ledger, invariants, reconciliation
                   │            │
                   ▼            ▼
              PostgreSQL     Redis (optional: rate limiter, read cache)
+
+    /metrics ──► Prometheus ──► Grafana
 
 Correctness is enforced by the database, not by application code. The primary key on `(client_id, idempotency_key)` guarantees that only one concurrent request wins, and `SELECT ... FOR UPDATE` serializes access to account balances. Redis is used only for rate limiting and read caching; if it is unavailable, payments still work.
 
@@ -83,7 +89,7 @@ The *hot* workload sends every payment between the same two accounts, so every t
 | Spread, throughput | 1,704 req/s | **2,745 req/s** | +61% |
 | Spread, p95 latency | 34 ms | 20 ms | −40% |
 
-Two changes produced this: collapsing the transaction's writes into a single SQL statement (shorter lock hold time), and the per-account concurrency limiter (see below). No requests failed in any run.
+Two changes produced this: collapsing the transaction's writes into a single SQL statement (shorter lock hold time), and the per-account concurrency limiter. No requests failed in any run.
 
 ### Cost of the rate limiter
 
@@ -93,39 +99,67 @@ With the limit set high enough that nothing is rejected, the extra Redis round t
 
 `GET /v1/payments/{id}` over 200 payments: **13,480 → 17,967 req/s (+33%)**, median latency 3.34 → 2.47 ms. The p95 improved only slightly (4.81 → 4.54 ms), because a primary-key lookup in a local Postgres is already fast. This is close to the cache's best case (a tiny working set and an essentially 100% hit rate), so real gains depend on the hit rate.
 
+## Reliability
+
+- **Crash before commit.** A failure injected after the key claim, after the account locks, or just before commit leaves no trace: no payment, idempotency key, ledger row, or balance change. A retry with the same key then succeeds exactly once.
+- **Crash after commit.** If the payment commits but the client never gets the answer, retrying with the same key replays the stored result: one payment, charged once.
+- **Chaos test.** 40 concurrent payments with 15% random injected failures at each point and random `pg_terminate_backend` kills of in-transaction connections, with clients retrying under the same key. In one run this took 86 attempts, 41 injected errors, and 6 connection-kill rounds; the end state was exactly 40 payments, exactly 4,000 cents moved, and no invariant violations.
+- **The crash test was verified by breaking the code.** Claiming the idempotency key outside the transaction made all three crash-before-commit cases fail (`idempotency keys left behind: 1`).
+- **Reconciliation.** After a deliberate +500 corruption of a balance, reconciliation reported `balance_drift` and exited with code 1; after the repair it reported no violations. In the background loop, the violation gauge rose to 1 within one interval and returned to 0 after the repair.
+
 ## Notable Design Decisions
 
 - **Why a per-account limiter instead of a smaller connection pool.** The first hot-account fix attempt was shrinking the pool. Tail latency improved sharply (p95 233 ms at 16 connections vs 91 ms at 2), because connections waiting on a row lock do no useful work. But a pool of 2 cut the spread workload from 2,714 to 716 req/s, so no single pool size suited both workloads. Limiting concurrency per account keeps the full pool for everyone else while a hot account queues in Go. Accounts are acquired in id order, the same rule that prevents database deadlocks.
 - **The limiter is per process.** If several server instances ran, each would have its own queues, so some lock waiting at the database could return. Coordinating across instances would need a shared store such as Redis.
 - **The concurrency test was verified by breaking the code.** To confirm the opposite-direction test really catches lock-ordering bugs, the ordered locking was temporarily replaced with payer-first locking. The test then failed with Postgres `deadlock detected` errors, and passed again once the change was reverted.
-- **The rate limiter is REST-only for now.** It is applied as HTTP middleware on `POST /v1/payments`. The gRPC `CreatePayment` call is not rate limited yet.
-- **Features that change performance are opt-in.** Rate limiting and caching are off unless their environment variables are set, which keeps load-test baselines reproducible.
+- **The rate limiter fails open.** If Redis is down, payments are allowed and the error is logged, because a broken limiter must not stop payments.
+- **Features that change performance are opt-in.** Rate limiting, caching, and background reconciliation are off unless their environment variables are set, which keeps load-test baselines reproducible.
+
+More detail, including how each decision was measured, is in [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## Known Limitations
+
+- Single node: one Postgres, no replicas or failover, and the per-account limiter is per server process.
+- No authentication. `X-Client-Id` is self-declared, gRPC has no TLS, and `/metrics` is served on the public port.
+- A response lost after commit is only safe because the client retries with the same idempotency key.
+- Reconciliation detects drift since its first run; it cannot tell whether the starting balance was right.
+- Fault injection simulates crashes with injected errors and killed database connections, not by killing the Go process or the database container.
+- Not built: refunds and reversals, currency conversion, ledger partitioning, multi-instance deployment, alerting rules.
 
 ## Tech Stack
 
 - Go 1.27 (standard library `net/http`), gRPC and Protocol Buffers
 - PostgreSQL 17 via `pgx` v5 (`pgxpool`)
 - Redis 7 via `go-redis` v9 (rate limiter and read cache)
+- Prometheus and Grafana (metrics and dashboard)
 - Docker Compose for local infrastructure
 - k6 for load testing
 
 ## Repository Structure
 
     .
-    ├── cmd/server/            # Server entry point (REST, gRPC, /healthz)
+    ├── cmd/
+    │   ├── server/            # Server entry point (REST, gRPC, /healthz, /metrics)
+    │   ├── reconcile/         # Reconciliation command-line tool
+    │   └── grpcprobe/         # Small gRPC client for checking rate limiting by hand
     ├── internal/
     │   ├── api/               # REST handlers
     │   ├── grpcapi/           # gRPC server
     │   ├── gen/paymentpb/     # Generated protobuf code (do not edit)
-    │   ├── payments/          # Payment logic, account limiter, invariants, tests
+    │   ├── payments/          # Payment logic, limiter, invariants, reconciliation, fault hook, tests
     │   ├── paymentcache/      # Redis read cache
-    │   └── ratelimit/         # Redis token-bucket rate limiter and HTTP middleware
+    │   ├── ratelimit/         # Redis token-bucket limiter, HTTP middleware, gRPC interceptor
+    │   └── metrics/           # Prometheus metrics and HTTP middleware
     ├── proto/payment/v1/      # gRPC contract
     ├── db/
     │   ├── schema.sql         # Tables, enum, indexes (auto-applied on first container start)
+    │   ├── 002_reconciliation.sql  # Reconciliation baselines table (auto-applied on first start)
     │   └── seed.sql           # Two demo accounts
+    ├── monitoring/            # Prometheus config and provisioned Grafana dashboard
     ├── loadtest/              # k6 scripts, reset and seed SQL, sweep scripts, saved results
+    ├── docs/DESIGN.md         # Design decisions, measurements, limitations
     ├── docker-compose.yml     # Postgres and Redis
+    ├── docker-compose.monitoring.yml  # Prometheus and Grafana
     └── go.mod
 
 ## Running Locally
@@ -160,20 +194,39 @@ curl.exe -i -X POST http://localhost:8080/v1/payments -H "X-Client-Id: demo" -H 
 
 Run it twice: the first call returns `201`, the second returns `200` with `Idempotent-Replayed: true` and no second payment.
 
+### Reconciliation
+
+```
+go run ./cmd/reconcile
+```
+
+Prints `reconciliation OK: no violations`, or one `VIOLATION` line per problem and exit code 1. To run it continuously inside the server, set `RECONCILE_INTERVAL` (for example `30s`).
+
+### Monitoring
+
+With the server running:
+
+```
+docker compose -f docker-compose.monitoring.yml up -d
+```
+
+Open the dashboard at `http://localhost:3000/d/payment-service`. Prometheus is at `http://localhost:9091`. Both are bound to localhost with local development settings only.
+
 ### Configuration
 
-All settings are environment variables. Rate limiting and caching are off unless enabled.
+All settings are environment variables. Rate limiting, caching, and background reconciliation are off unless enabled.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | `postgres://payments:payments@localhost:5432/payments` | Postgres connection. Add `?pool_max_conns=N` to size the pool. |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
-| `RATE_LIMIT_PER_SEC` | unset (off) | Sustained requests per second allowed per client |
+| `RATE_LIMIT_PER_SEC` | unset (off) | Sustained requests per second allowed per client (REST and gRPC) |
 | `RATE_LIMIT_BURST` | 2 × the rate | Burst size of the token bucket |
 | `PAYMENT_CACHE_TTL` | unset (off) | Enables the read cache, for example `5m` |
 | `ACCOUNT_CONCURRENCY` | `2` | In-flight payments allowed per account |
+| `RECONCILE_INTERVAL` | unset (off) | Runs reconciliation in the background at this interval, for example `30s` |
 
-> The Postgres and Redis credentials in `docker-compose.yml` are throwaway **local development** values.
+> The Postgres, Redis, and Grafana settings in the compose files are throwaway **local development** values.
 
 ## Testing
 
@@ -181,16 +234,19 @@ All settings are environment variables. Rate limiting and caching are off unless
 go test ./... -p 1
 ```
 
-Tests need the Docker containers running. Use `-p 1`: the packages share one development database, and running them in parallel would let them wipe each other's data. Covered so far:
+Tests need the Docker containers running. Use `-p 1`: the packages share one development database, and running them in parallel would let them wipe each other's data. Covered:
 
 - 100 concurrent identical requests create exactly one payment
 - Same idempotency key with a different body is rejected
 - Insufficient funds produces a `FAILED` payment and moves no money
 - 400 concurrent requests in both directions between the same two accounts (each sent twice) cause no deadlocks, create exactly the expected payments, leave exact balances, and keep total money constant
 - The ledger invariant checker passes on healthy data and detects a deliberately deleted ledger row
+- Reconciliation passes on clean data, detects balance drift, and flags a key with no payment
+- Crashes before commit leave no trace and a retry succeeds once; a crash after commit followed by a retry charges once
+- The chaos test: concurrent payments under random failures and killed connections move money exactly once
 - The gRPC lifecycle: create, idempotent replay, key reuse, get, error codes, recorded failure
 - The per-account limiter blocks, isolates accounts, and cleans up after itself
-- The token-bucket rate limiter limits, refills, and returns `429` with `Retry-After`
+- The token-bucket rate limiter limits, refills, and returns `429` with `Retry-After`; the gRPC interceptor limits per client, per method
 - The read cache hits, does not cache not-found results, and expires entries
 
 > The tests truncate the payment tables and reset account balances, so run them against the local dev database only.
@@ -230,12 +286,12 @@ The script resets the data before each run, starts its own server build, and pri
 - [x] Redis token-bucket rate limiter
 - [x] Redis read cache
 
-### Milestone 4 — Reliability
-- [ ] Reconciliation job that detects and reports ledger and payment mismatches
-- [ ] Fault injection (crashes and failures mid-transaction)
-- [ ] Metrics and dashboards with Prometheus and Grafana
-- [ ] Rate limiting for the gRPC API
+### Milestone 4 — Reliability ✅
+- [x] Reconciliation that detects balance drift and orphaned idempotency keys, as a CLI and a background loop
+- [x] Fault injection and a chaos test, verified by breaking the code
+- [x] Metrics and a dashboard with Prometheus and Grafana
+- [x] Rate limiting for the gRPC API
 
-### Milestone 5 — Polish
-- [ ] Architecture and design-decision write-up
-- [ ] Final README with measured results
+### Milestone 5 — Polish ✅
+- [x] Architecture and design-decision write-up (`docs/DESIGN.md`)
+- [x] Final README with measured results
