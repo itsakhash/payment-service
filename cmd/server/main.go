@@ -52,6 +52,14 @@ func main() {
 	}
 
 	svc := payments.NewService(pool)
+
+	// Optional background reconciliation. Uses context.Background() on purpose:
+	// ctx above has a 5-second timeout and would stop the loop.
+	if iv, perr := time.ParseDuration(os.Getenv("RECONCILE_INTERVAL")); perr == nil && iv > 0 {
+		go svc.RunReconcileLoop(context.Background(), iv)
+		log.Printf("reconciliation every %s", iv)
+	}
+
 	if ttl, perr := time.ParseDuration(os.Getenv("PAYMENT_CACHE_TTL")); perr == nil && ttl > 0 {
 		cacheURL := os.Getenv("REDIS_URL")
 		if cacheURL == "" {

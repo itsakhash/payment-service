@@ -27,10 +27,28 @@ var (
 		Name: "payments_total",
 		Help: "CreatePayment outcomes.",
 	}, []string{"outcome"})
+
+	// ReconcileViolations is the number of violations found by the latest run.
+	ReconcileViolations = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "reconcile_violations",
+		Help: "Violations found by the most recent reconciliation run.",
+	})
+
+	// ReconcileLastSuccess is the Unix time of the last run that completed.
+	ReconcileLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "reconcile_last_success_timestamp_seconds",
+		Help: "Unix time of the last reconciliation run that completed.",
+	})
+
+	ReconcileRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "reconcile_runs_total",
+		Help: "Reconciliation runs by result: clean, violations or error.",
+	}, []string{"result"})
 )
 
 func init() {
-	prometheus.MustRegister(HTTPRequests, HTTPDuration, Payments)
+	prometheus.MustRegister(HTTPRequests, HTTPDuration, Payments,
+		ReconcileViolations, ReconcileLastSuccess, ReconcileRuns)
 }
 
 type statusRecorder struct {
